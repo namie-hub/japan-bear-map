@@ -1,0 +1,47 @@
+name: Refresh bear data
+
+on:
+  schedule:
+    # 21:00 UTC = 06:00 JST daily. To run less often, use e.g.
+    # '0 21 * * 0' for weekly Sunday nights UTC.
+    - cron: '0 21 * * *'
+  workflow_dispatch: {}   # allows manual runs from the Actions tab
+
+permissions:
+  contents: write
+
+concurrency:
+  group: refresh-bear-data
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run ingestion
+        run: python ingest.py
+
+      - name: Commit if data changed
+        run: |
+          git config user.name "bear-data-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add akita_bears.json bear_data.js
+          if git diff --cached --quiet; then
+            echo "No data changes."
+          else
+            git commit -m "Data refresh: $(date -u +%Y-%m-%d)"
+            git push
+          fi
+
+# When the repository has GitHub Pages enabled with source
+# "Deploy from a branch" -> main -> / (root), the push above
+# automatically republishes the site within a couple of minutes.
