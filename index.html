@@ -1,0 +1,394 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Japan Bear Activity Map</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css">
+<link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css">
+<style>
+  html,body{height:100%;margin:0;font-family:system-ui,-apple-system,sans-serif}
+  #map{height:100%}
+  .panel{position:absolute;z-index:1000;top:12px;left:12px;width:min(370px,calc(100vw - 24px));
+    background:white;padding:14px;border-radius:12px;box-shadow:0 4px 20px #0003;
+    max-height:calc(100vh - 24px);overflow:auto}
+  h1{font-size:18px;margin:0 0 4px}
+  .sub{font-size:12px;color:#555;margin-bottom:10px}
+  .row{display:flex;gap:8px;flex-wrap:wrap;margin:7px 0}
+  button,select,input{font:inherit;padding:7px 9px;border:1px solid #bbb;border-radius:8px;background:white}
+  button{cursor:pointer}
+  button:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid #b30000;outline-offset:1px}
+  .stat{font-size:13px;margin-top:7px}
+  .stat b{color:#b30000}
+  .warn{font-size:11px;color:#6b4b00;margin-top:8px}
+  .meta{font-size:11px;color:#777;margin-top:6px}
+  .links{margin-top:10px;font-size:12px}
+  .links h2{font-size:12px;margin:0 0 5px;color:#333;font-weight:600}
+  .links a{display:block;padding:6px 8px;margin:4px 0;border:1px solid #ddd;border-radius:7px;
+    color:#0645ad;text-decoration:none;background:#fafafa}
+  .links a:hover{background:#f0f4ff;border-color:#b7c6f0}
+  .links a:focus-visible{outline:2px solid #b30000;outline-offset:1px}
+  .links .note{color:#6b4b00;font-size:11px;margin:2px 0 0}
+  .legend{background:white;padding:7px 9px;border-radius:8px;box-shadow:0 1px 6px #0002;font-size:12px}
+  .dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:5px}
+  #toggle{display:none;position:absolute;z-index:1001;top:12px;left:12px}
+  @media (max-width:600px){
+    #toggle{display:block}
+    .panel.hidden{display:none}
+  }
+</style>
+</head>
+<body>
+<button id="toggle" aria-label="Show or hide filters">Filters</button>
+<div class="panel" id="panel">
+  <h1>Japan Bear Activity Map</h1>
+  <div class="sub" id="subtitle">Japan-wide bear activity from official open data — reported activity, not risk
+    <span style="color:#aaa">· build 2026-07-10-univ2</span></div>
+  <div class="row">
+    <select id="source" aria-label="Data source"><option value="all">All sources</option></select>
+  </div>
+  <div class="row">
+    <select id="period" aria-label="Time period">
+      <option value="30">Last 30 days</option>
+      <option value="90" selected>Last 90 days</option>
+      <option value="365">Last 365 days</option>
+      <option value="all">All records</option>
+    </select>
+    <select id="type" aria-label="Incident type"><option value="all">All incident types</option></select>
+  </div>
+  <div class="row">
+    <select id="place" aria-label="Municipality filter"><option value="">All municipalities</option></select>
+  </div>
+  <div class="row">
+    <label class="chk" style="font-size:13px;display:flex;align-items:center;gap:6px;cursor:pointer">
+      <input type="checkbox" id="coverage" checked> Show data-coverage shading</label>
+  </div>
+  <div class="row">
+    <select id="view" aria-label="Display mode">
+      <option value="cluster" selected>View: clustered points</option>
+      <option value="points">View: all points</option>
+      <option value="heat">View: heatmap</option>
+    </select>
+  </div>
+  <div class="row">
+    <button id="locate">Use my location</button>
+    <select id="radius" aria-label="Proximity radius">
+      <option value="5">within 5 km</option>
+      <option value="10" selected>within 10 km</option>
+      <option value="25">within 25 km</option>
+      <option value="50">within 50 km</option>
+    </select>
+  </div>
+  <div id="stat" class="stat"></div>
+  <div class="warn">Reports are not probabilities, and the heatmap shows reporting density, not attack risk.
+    Categories and collection methods differ between prefectures. Locations may be approximate.
+    Confirm current conditions with local authorities.</div>
+  <div class="meta" id="meta"></div>
+  <div class="links" id="links"></div>
+</div>
+<div id="map"></div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
+<script src="https://unpkg.com/leaflet.heat@0.2.0/dist/leaflet-heat.js"></script>
+<script src="bear_data.js"></script>
+<script src="prefectures.js"></script>
+<script>
+window.addEventListener('error', e=>{
+  const s=document.getElementById('stat');
+  if(s) s.textContent='Something went wrong: '+(e.message||'script error')+
+    ' — try reloading; if it persists, check the browser console.';
+});
+if(!window.BEAR_DATA){
+  document.getElementById('stat').textContent =
+    'bear_data.js not found. Keep it in the same folder as index.html, or regenerate it with ingest.py.';
+}
+const PACK = window.BEAR_DATA || {meta:{sources:[]}, records:[]};
+const DATA = PACK.records;
+const META = PACK.meta;
+const SOURCES = {};
+(META.sources||[]).forEach(s=>SOURCES[s.key]=s);
+
+// English glosses for source category strings (originals preserved)
+const TYPE_EN = {
+  '目撃':'Sighting','痕跡(その他)':'Traces (other)','痕跡(食害)':'Traces (feeding damage)',
+  '人身被害':'Human injury','痕跡':'Traces','目撃・痕跡':'Sighting + traces','その他':'Other',
+  'Witness':'Sighting','trace':'Traces','Filming':'Camera footage','capture':'Capture'
+};
+const label = t => TYPE_EN[t] && TYPE_EN[t]!==t ? `${t} · ${TYPE_EN[t]}` : t;
+const INJURY_TYPES = new Set(['人身被害']);
+
+const map = L.map('map',{preferCanvas:true});
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{
+  maxZoom:19,attribution:'© OpenStreetMap contributors'
+}).addTo(map);
+if(DATA.length){
+  map.fitBounds(L.latLngBounds(DATA.map(x=>[x.latitude,x.longitude])).pad(0.05));
+}else{
+  map.setView([38.5,139.9],6);
+}
+
+// ---- Nationwide coverage overlay -------------------------------------
+// Shades every prefecture by data status so a blank area is never ambiguous.
+const COVERAGE = META.coverage || {};
+const STATUS_STYLE = {
+  covered:{fillColor:'#2e7d32',fillOpacity:.10,color:'#2e7d32',weight:1,opacity:.5},
+  partial:{fillColor:'#f9a825',fillOpacity:.12,color:'#b8860b',weight:1,opacity:.5},
+  possible:{fillColor:'#f9a825',fillOpacity:.12,color:'#b8860b',weight:1,opacity:.5},
+  info:{fillColor:'#6d4c41',fillOpacity:.10,color:'#6d4c41',weight:1,opacity:.5},
+  none:{fillColor:'#9e9e9e',fillOpacity:.10,color:'#777',weight:.7,opacity:.4}
+};
+const STATUS_LABEL = {
+  covered:'Covered — data shown on this map',
+  partial:'Partially covered',
+  possible:'Data exists, adapter not enabled yet',
+  info:'Special case — see note',
+  none:'No machine-readable open dataset found (July 2026)'
+};
+let coverageLayer=null;
+if(window.PREF_BOUNDARIES){
+  coverageLayer=L.geoJSON(window.PREF_BOUNDARIES,{
+    style:f=>{
+      const c=COVERAGE[f.properties.name]||{status:'none'};
+      return STATUS_STYLE[c.status]||STATUS_STYLE.none;
+    },
+    onEachFeature:(f,layer)=>{
+      const c=COVERAGE[f.properties.name]||{status:'none'};
+      let html=`<b>${escapeHtml(f.properties.name)}</b><br>`+
+        `${escapeHtml(STATUS_LABEL[c.status]||c.status)}`;
+      if(c.note)html+=`<br><small>${escapeHtml(c.note)}</small>`;
+      if(c.status!=='covered'){
+        html+=`<br><small><b>A blank map here means no data — NOT no bears.</b> `+
+          `Check the official links in the panel before traveling.</small>`;
+      }
+      layer.bindPopup(html);
+    }
+  });
+  coverageLayer.addTo(map);
+}else{
+  const cv=document.getElementById('coverage');
+  if(cv && cv.parentElement) cv.parentElement.innerHTML=
+    '<span style="color:#b30000;font-size:12px">Coverage shading unavailable — '+
+    'prefectures.js was not found. Keep index.html, bear_data.js and '+
+    'prefectures.js in the same folder.</span>';
+}
+
+let plainLayer=L.layerGroup();
+let clusterLayer=L.markerClusterGroup({chunkedLoading:true,maxClusterRadius:45,disableClusteringAtZoom:12});
+let heatLayer=null, activeLayer=null, userMarker=null, userCircle=null, userPos=null;
+
+// Populate filters from the data
+(META.sources||[]).forEach(s=>document.getElementById('source').insertAdjacentHTML('beforeend',
+  `<option value="${escapeHtml(s.key)}">${escapeHtml(s.name)} (${s.record_count.toLocaleString()})</option>`));
+const types=[...new Set(DATA.map(x=>x.incident_type))].sort();
+types.forEach(t=>document.getElementById('type').insertAdjacentHTML('beforeend',
+  `<option value="${escapeHtml(t)}">${escapeHtml(label(t))}</option>`));
+// Romanized glosses for municipality names (display only; values stay as-is)
+const MUNI_EN = {
+ // Akita
+ '秋田市':'Akita City','横手市':'Yokote','大館市':'Odate','男鹿市':'Oga','湯沢市':'Yuzawa',
+ '鹿角市':'Kazuno','由利本荘市':'Yurihonjo','潟上市':'Katagami','大仙市':'Daisen',
+ '北秋田市':'Kita-Akita','にかほ市':'Nikaho','仙北市':'Semboku','能代市':'Noshiro',
+ '小坂町':'Kosaka','藤里町':'Fujisato','三種町':'Mitane','八峰町':'Happo',
+ '五城目町':'Gojome','八郎潟町':'Hachirogata','井川町':'Ikawa','大潟村':'Ogata',
+ '美郷町':'Misato','羽後町':'Ugo','東成瀬村':'Higashinaruse','上小阿仁村':'Kamikoani',
+ // Yamagata
+ '山形市':'Yamagata City','米沢市':'Yonezawa','鶴岡市':'Tsuruoka','酒田市':'Sakata',
+ '新庄市':'Shinjo','寒河江市':'Sagae','上山市':'Kaminoyama','村山市':'Murayama',
+ '長井市':'Nagai','天童市':'Tendo','東根市':'Higashine','尾花沢市':'Obanazawa',
+ '南陽市':'Nanyo','山辺町':'Yamanobe','中山町':'Nakayama','河北町':'Kahoku',
+ '西川町':'Nishikawa','朝日町':'Asahi','大江町':'Oe','大石田町':'Oishida',
+ '金山町':'Kaneyama','最上町':'Mogami','舟形町':'Funagata','真室川町':'Mamurogawa',
+ '大蔵村':'Okura','鮭川村':'Sakegawa','戸沢村':'Tozawa','高畠町':'Takahata',
+ '川西町':'Kawanishi','小国町':'Oguni','白鷹町':'Shirataka','飯豊町':'Iide',
+ '三川町':'Mikawa','庄内町':'Shonai','遊佐町':'Yuza',
+ // Tottori
+ '鳥取市':'Tottori City','米子市':'Yonago','倉吉市':'Kurayoshi','境港市':'Sakaiminato',
+ '岩美町':'Iwami','若桜町':'Wakasa','智頭町':'Chizu','八頭町':'Yazu','三朝町':'Misasa',
+ '湯梨浜町':'Yurihama','琴浦町':'Kotoura','北栄町':'Hokuei','日吉津村':'Hiezu',
+ '大山町':'Daisen (Tottori)','南部町':'Nanbu','伯耆町':'Hoki','日南町':'Nichinan',
+ '日野町':'Hino','江府町':'Kofu'
+};
+const muniLabel = m => MUNI_EN[m] ? `${MUNI_EN[m]} · ${m}` : m;
+{
+ // Group municipalities by the source(s) they appear in
+ const bySource={};
+ DATA.forEach(x=>{
+   if(!x.municipality)return;
+   (bySource[x.source_key]=bySource[x.source_key]||new Set()).add(x.municipality);
+ });
+ const sel=document.getElementById('place');
+ Object.entries(bySource).forEach(([key,set])=>{
+   const srcName=(SOURCES[key]||{}).name||key;
+   const opts=[...set].sort((a,b)=>muniLabel(a).localeCompare(muniLabel(b)))
+     .map(m=>`<option value="${escapeHtml(m)}">${escapeHtml(muniLabel(m))}</option>`).join('');
+   sel.insertAdjacentHTML('beforeend',
+     `<optgroup label="${escapeHtml(srcName)}">${opts}</optgroup>`);
+ });
+}
+
+if(META.generated_at){
+  const fmt=x=>new Date(x).toLocaleDateString();
+  const perSource=(META.sources||[]).map(s=>{
+    const short=s.key.charAt(0).toUpperCase()+s.key.slice(1);
+    const pub=s.published?`published ${fmt(s.published)} · `:'';
+    return `<b>${escapeHtml(short)}</b>: ${escapeHtml(pub)}newest report ${s.date_max?fmt(s.date_max):'?'}`;
+  }).join('<br>');
+  document.getElementById('meta').innerHTML =
+    `Fetched ${fmt(META.generated_at)} · ${META.record_count.toLocaleString()} records<br>`+
+    perSource+`<br>`+
+    `<i>Each source publishes on its own schedule; the newest-report date is the
+    best guide to how current each source really is.</i>`;
+}
+
+function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+
+// Extra official resources for regions that have NO open dataset (so no
+// records here) but that travelers still need. Keyed loosely; always shown.
+const NO_DATA_REGIONS = [{
+  name: "Shikoku (Tsurugi range)",
+  url: "https://www.pref.tokushima.lg.jp/ippannokata/kurashi/shizen/7314177/",
+  note: "~20–25 critically endangered bears on the Tokushima–Kōchi border. "+
+        "No open data = blank map, NOT \"no bears.\" Tokushima publishes an "+
+        "expert-confirmed sightings list; carry a bell on the Tsurugi trails "+
+        "and Super-Rindō forest road."
+}];
+
+function renderLinks(){
+  const box=document.getElementById('links');
+  const src=document.getElementById('source').value;
+  const shown=(META.sources||[]).filter(s=>src==='all'||s.key===src);
+  let html='<h2>Official live maps — check before you go</h2>';
+  html+='<p class="note">These prefectural maps update faster than this snapshot. '+
+    'Always confirm current conditions here for the days you\'ll be out.</p>';
+  shown.forEach(s=>{
+    const url=s.live_map||s.url;
+    if(!url)return;
+    html+=`<a href="${escapeHtml(url)}" target="_blank" rel="noopener">`+
+      `${escapeHtml(s.name)} — official map ↗</a>`;
+  });
+  NO_DATA_REGIONS.forEach(r=>{
+    html+=`<a href="${escapeHtml(r.url)}" target="_blank" rel="noopener">`+
+      `${escapeHtml(r.name)} — official info ↗</a>`+
+      `<div class="note">${escapeHtml(r.note)}</div>`;
+  });
+  (META.universal_links||[]).forEach(u=>{
+    html+=`<a href="${escapeHtml(u.url)}" target="_blank" rel="noopener">`+
+      `${escapeHtml(u.name)} ↗</a>`;
+  });
+  html+='<p class="note">For any prefecture shaded gray on this map, use the '+
+    'all-prefecture directory above to find its official bear page.</p>';
+  box.innerHTML=html;
+}
+function ageDays(d){return (Date.now()-new Date(d).getTime())/86400000;}
+function km(a,b,c,d){
+ const R=6371,p=Math.PI/180,x=(c-a)*p,y=(d-b)*p;
+ const q=Math.sin(x/2)**2+Math.cos(a*p)*Math.cos(c*p)*Math.sin(y/2)**2;
+ return 2*R*Math.asin(Math.sqrt(q));
+}
+function shade(days){
+ if(days<=7)return '#b30000'; if(days<=30)return '#e34a33'; if(days<=90)return '#fc8d59';
+ return '#777';
+}
+
+function apply(){
+ if(activeLayer)map.removeLayer(activeLayer);
+ plainLayer.clearLayers(); clusterLayer.clearLayers();
+ if(heatLayer){map.removeLayer(heatLayer);heatLayer=null;}
+
+ const view=document.getElementById('view').value;
+ const src=document.getElementById('source').value;
+ const p=document.getElementById('period').value;
+ const t=document.getElementById('type').value;
+ const place=document.getElementById('place').value;
+ const radius=+document.getElementById('radius').value;
+
+ let shown=0,nearby=0,injuries=0;
+ const markers=[],heatPts=[];
+ for(const x of DATA){
+   if(src!=='all' && x.source_key!==src)continue;
+   const days=ageDays(x.reported_at);
+   if(p!=='all' && days>+p)continue;
+   if(t!=='all' && x.incident_type!==t)continue;
+   if(place && x.municipality!==place)continue;
+   const dist=userPos?km(userPos[0],userPos[1],x.latitude,x.longitude):null;
+   if(userPos && dist<=radius)nearby++;
+   if(INJURY_TYPES.has(x.incident_type))injuries++;
+   shown++;
+   if(view==='heat'){heatPts.push([x.latitude,x.longitude,0.6]);continue;}
+   const marker=L.circleMarker([x.latitude,x.longitude],{
+     radius:days<=30?5:4,weight:1,color:shade(days),fillColor:shade(days),fillOpacity:.68
+   });
+   const srcMeta=SOURCES[x.source_key]||{};
+   marker.bindPopup(`<b>${escapeHtml(label(x.incident_type))}${x.municipality?` — ${escapeHtml(x.municipality)}`:''}</b><br>
+     ${escapeHtml(new Date(x.reported_at).toLocaleString())}
+     ${x.location?`<br>${escapeHtml(x.location)}`:''}
+     ${x.description?`<br><br>${escapeHtml(x.description)}`:''}
+     ${x.accuracy?`<br><small>Location accuracy: ${escapeHtml(x.accuracy)}</small>`:''}
+     ${dist!==null?`<br><b>${dist.toFixed(1)} km from your location</b>`:''}
+     <br><small>Source: ${escapeHtml(srcMeta.name||x.source_key)} · ID ${escapeHtml(x.id)}</small>`);
+   markers.push(marker);
+ }
+
+ if(view==='heat'){
+   if(typeof L.heatLayer!=='function'){
+     document.getElementById('stat').textContent=
+       'Heatmap library could not be loaded (check your internet connection); showing clustered points instead.';
+     document.getElementById('view').value='cluster';
+     return apply();
+   }
+   heatLayer=L.heatLayer(heatPts,{radius:16,blur:14,maxZoom:11}).addTo(map);
+   activeLayer=null;
+ }else if(view==='cluster'){
+   clusterLayer.addLayers(markers); activeLayer=clusterLayer; activeLayer.addTo(map);
+ }else{
+   markers.forEach(m=>m.addTo(plainLayer)); activeLayer=plainLayer; activeLayer.addTo(map);
+ }
+
+ document.getElementById('stat').innerHTML=
+   `${shown.toLocaleString()} reports ${view==='heat'?'in heatmap':'displayed'}`+
+   (injuries?` · <b>${injuries.toLocaleString()} human-injury report${injuries>1?'s':''}</b>`:'')+
+   (userPos?` · ${nearby.toLocaleString()} within ${radius} km`:'');
+}
+
+['period','type','radius','view','source','place'].forEach(id=>{
+  document.getElementById(id).onchange=apply;
+});
+document.getElementById('source').addEventListener('change',renderLinks);
+document.getElementById('coverage').onchange=e=>{
+  if(!coverageLayer)return;
+  if(e.target.checked)coverageLayer.addTo(map); else map.removeLayer(coverageLayer);
+};
+document.getElementById('toggle').onclick=()=>document.getElementById('panel').classList.toggle('hidden');
+
+document.getElementById('locate').onclick=()=>{
+ if(!navigator.geolocation){alert('Geolocation is not supported.');return;}
+ navigator.geolocation.getCurrentPosition(pos=>{
+   userPos=[pos.coords.latitude,pos.coords.longitude];
+   if(userMarker)map.removeLayer(userMarker); if(userCircle)map.removeLayer(userCircle);
+   userMarker=L.marker(userPos).addTo(map).bindPopup('Your location').openPopup();
+   userCircle=L.circle(userPos,{radius:+document.getElementById('radius').value*1000,fillOpacity:.05}).addTo(map);
+   map.setView(userPos,10); apply();
+ },err=>alert('Location unavailable: '+err.message));
+};
+
+const legend=L.control({position:'bottomright'});
+legend.onAdd=()=>{
+ const d=L.DomUtil.create('div','legend');
+ d.innerHTML='<b>Report age</b><br><span class="dot" style="background:#b30000"></span>≤7 days<br>'+
+ '<span class="dot" style="background:#e34a33"></span>≤30 days<br>'+
+ '<span class="dot" style="background:#fc8d59"></span>≤90 days<br>'+
+ '<span class="dot" style="background:#777"></span>Older<br>'+
+ '<b style="display:inline-block;margin-top:5px">Coverage</b><br>'+
+ '<span class="dot" style="background:#2e7d32"></span>Data on this map<br>'+
+ '<span class="dot" style="background:#f9a825"></span>Data exists elsewhere<br>'+
+ '<span class="dot" style="background:#9e9e9e"></span>No open data found';
+ return d;
+};
+legend.addTo(map);
+renderLinks();
+apply();
+</script>
+</body>
+</html>
