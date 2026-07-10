@@ -32,19 +32,29 @@
   .links .note{color:#6b4b00;font-size:11px;margin:2px 0 0}
   .legend{background:white;padding:7px 9px;border-radius:8px;box-shadow:0 1px 6px #0002;font-size:12px}
   .dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:5px}
-  #toggle{display:none;position:absolute;z-index:1001;top:12px;left:12px}
+  #toggle{display:none;position:fixed;z-index:1001;bottom:18px;left:50%;transform:translateX(-50%);
+    background:#b30000;color:#fff;border:none;border-radius:999px;padding:10px 18px;
+    box-shadow:0 4px 14px #0005;font-weight:600;font-size:14px}
+  #closePanel{display:none;position:absolute;top:8px;right:10px;border:none;background:none;
+    font-size:20px;line-height:1;color:#666;padding:6px;cursor:pointer}
   @media (max-width:600px){
     #toggle{display:block}
+    #closePanel{display:block}
+    .panel{position:fixed;top:auto;bottom:0;left:0;right:0;width:100%;max-width:none;
+      max-height:62vh;border-radius:16px 16px 0 0;box-shadow:0 -6px 24px #0004;
+      padding:14px 16px calc(16px + env(safe-area-inset-bottom))}
     .panel.hidden{display:none}
+    .legend{font-size:10px;padding:5px 7px}
   }
 </style>
 </head>
 <body>
-<button id="toggle" aria-label="Show or hide filters">Filters</button>
+<button id="toggle" aria-label="Show filters and info">Filters</button>
 <div class="panel" id="panel">
+  <button id="closePanel" aria-label="Close panel">✕</button>
   <h1>Japan Bear Activity Map</h1>
   <div class="sub" id="subtitle">Japan-wide bear activity from official open data — reported activity, not risk
-    <span style="color:#aaa">· build 2026-07-10-univ2</span></div>
+    <span style="color:#aaa">· build 2026-07-10-univ3</span></div>
   <div class="row">
     <select id="source" aria-label="Data source"><option value="all">All sources</option></select>
   </div>
@@ -85,7 +95,10 @@
     Categories and collection methods differ between prefectures. Locations may be approximate.
     Confirm current conditions with local authorities.</div>
   <div class="meta" id="meta"></div>
-  <div class="links" id="links"></div>
+  <details style="margin-top:8px">
+    <summary style="cursor:pointer;font-size:12px;color:#0645ad;font-weight:600">Official live maps &amp; all-Japan links</summary>
+    <div class="links" id="links"></div>
+  </details>
 </div>
 <div id="map"></div>
 
@@ -259,8 +272,7 @@ function renderLinks(){
   const box=document.getElementById('links');
   const src=document.getElementById('source').value;
   const shown=(META.sources||[]).filter(s=>src==='all'||s.key===src);
-  let html='<h2>Official live maps — check before you go</h2>';
-  html+='<p class="note">These prefectural maps update faster than this snapshot. '+
+  let html='<p class="note">These prefectural maps update faster than this snapshot. '+
     'Always confirm current conditions here for the days you\'ll be out.</p>';
   shown.forEach(s=>{
     const url=s.live_map||s.url;
@@ -350,6 +362,8 @@ function apply(){
    `${shown.toLocaleString()} reports ${view==='heat'?'in heatmap':'displayed'}`+
    (injuries?` · <b>${injuries.toLocaleString()} human-injury report${injuries>1?'s':''}</b>`:'')+
    (userPos?` · ${nearby.toLocaleString()} within ${radius} km`:'');
+ document.getElementById('toggle').textContent=
+   `${shown.toLocaleString()} reports · Filters`;
 }
 
 ['period','type','radius','view','source','place'].forEach(id=>{
@@ -360,7 +374,10 @@ document.getElementById('coverage').onchange=e=>{
   if(!coverageLayer)return;
   if(e.target.checked)coverageLayer.addTo(map); else map.removeLayer(coverageLayer);
 };
+const IS_PHONE = window.matchMedia && window.matchMedia('(max-width:600px)').matches;
+if(IS_PHONE) document.getElementById('panel').classList.add('hidden');
 document.getElementById('toggle').onclick=()=>document.getElementById('panel').classList.toggle('hidden');
+document.getElementById('closePanel').onclick=()=>document.getElementById('panel').classList.add('hidden');
 
 document.getElementById('locate').onclick=()=>{
  if(!navigator.geolocation){alert('Geolocation is not supported.');return;}
