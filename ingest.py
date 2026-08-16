@@ -36,6 +36,16 @@ def clean(value) -> str:
     return "" if s.lower() == "nan" else s
 
 
+def jst_iso(value) -> str:
+    """Return an explicit ISO-8601 timestamp in Japan Standard Time."""
+    ts = pd.Timestamp(value)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("Asia/Tokyo")
+    else:
+        ts = ts.tz_convert("Asia/Tokyo")
+    return ts.isoformat()
+
+
 def download(url: str, retries: int = 3, backoff: float = 5.0) -> bytes:
     last_err = None
     for attempt in range(1, retries + 1):
@@ -94,7 +104,7 @@ def fetch_akita() -> tuple[list[dict], dict]:
         "incident_type": clean(r["情報種別"]),
         "municipality": clean(r["市町村"]),
         "location": clean(r["地番情報"]),
-        "reported_at": r["reported_at"].isoformat(),
+        "reported_at": jst_iso(r["reported_at"]),
         "species": "Asian black bear",
         "sex": clean(r["性別"]),
         "family_status": clean(r["単独か親子"]),
@@ -167,7 +177,7 @@ def fetch_tokyo() -> tuple[list[dict], dict]:
         "incident_type": clean(r[type_col]),
         "municipality": "",          # not provided by this source
         "location": "",
-        "reported_at": r["reported_at"].isoformat(),
+        "reported_at": jst_iso(r["reported_at"]),
         "species": "Asian black bear (unconfirmed reports may include lookalikes)",
         "sex": "",
         "family_status": "",
@@ -254,11 +264,11 @@ def fetch_tottori() -> tuple[list[dict], dict]:
         mm_ = re.search(r"^(?:鳥取県)?(?:[^郡]{1,4}郡)?(.{1,6}?[市町村])", loc)
         muni = mm_.group(1) if mm_ else ""
         # Combine date + time into an ISO timestamp where a time is given
-        iso = ts.isoformat()
+        iso = jst_iso(ts)
         if time_str and re.match(r"^\d{1,2}:\d{2}", time_str):
             hh, mm = time_str.split(":")[:2]
             try:
-                iso = ts.replace(hour=int(hh), minute=int(mm)).isoformat()
+                iso = jst_iso(ts.replace(hour=int(hh), minute=int(mm)))
             except ValueError:
                 pass
         records.append({
@@ -351,7 +361,7 @@ def fetch_yamagata() -> tuple[list[dict], dict]:
             "incident_type": "目撃",
             "municipality": clean(r.get("ユーザ名")),
             "location": clean(r.get("地名等")),
-            "reported_at": ts.isoformat(),
+            "reported_at": jst_iso(ts),
             "species": "Asian black bear",
             "sex": "", "family_status": "",
             "count": clean(r.get("目撃頭数")),
@@ -392,7 +402,7 @@ ADAPTERS = {"akita": fetch_akita, "tokyo": fetch_tokyo,
 #   covered  - adapter enabled above
 #   possible - machine-readable data identified but adapter not enabled
 #              (see note for why)
-#   none     - no machine-readable open dataset found as of July 2026
+#   none     - no machine-readable open dataset found as of August 2026
 # Prefectures not listed default to "none". Names must match the boundary
 # file (prefectures.js) name field.
 COVERAGE = {
@@ -420,18 +430,31 @@ COVERAGE = {
                      "news-compiled (San'in press) with unclear reuse "
                      "licence; adapter written but disabled."},
     "富山県": {"status": "possible",
-             "note": "Official クマっぷ published via Google My Maps (KML "
-                     "fetchable); adapter candidate."},
+             "note": "Official real-time クマっぷ ArcGIS dashboard, with "
+                     "records from 2015; adapter and reuse review needed."},
     "群馬県": {"status": "possible",
              "note": "Official ArcGIS dashboard; FeatureServer endpoint "
                      "likely queryable; adapter candidate."},
     "青森県": {"status": "possible",
-             "note": "くまログあおもり system; export availability unverified."},
+             "note": "Official くまログあおもり real-time system; public "
+                     "submissions require a separate verification tier."},
     "岩手県": {"status": "possible",
              "note": "Bears LINE app only; no public export; police data "
                      "not included. See fetch_iwate notes."},
     "宮城県": {"status": "possible",
              "note": "Annual 目撃等情報マップ published; format unverified."},
+    "新潟県": {"status": "possible",
+             "note": "Official ArcGIS bear-occurrence dashboard; adapter "
+                     "and reuse review needed."},
+    "福井県": {"status": "possible",
+             "note": "Official searchable bear-information system exposes "
+                     "structured incident details; reuse terms need review."},
+    "石川県": {"status": "possible",
+             "note": "Official current-year sightings and analysis maps; "
+                     "machine export and reuse terms need review."},
+    "岐阜県": {"status": "possible",
+             "note": "Official GIS map exists, but its terms prohibit "
+                     "secondary reuse without permission; link only."},
     "徳島県": {"status": "info",
              "note": "Shikoku's ~20-25 critically endangered bears (Tsurugi "
                      "range). Expert-confirmed sightings list only, no "
@@ -456,7 +479,7 @@ UNIVERSAL_LINKS = [
 def fetch_iwate() -> tuple[list[dict], dict]:
     """Not implemented — documented for future work.
 
-    As of July 2026, Iwate Prefecture has no machine-readable open dataset
+    As of August 2026, Iwate Prefecture has no machine-readable open dataset
     comparable to Akita's Kumadas or Tokyo's catalog CSV. Official sighting
     reports flow through "Bears", a crowd-reporting app embedded in the
     prefecture's LINE account, with no public download or API; police-held
@@ -475,8 +498,36 @@ def fetch_iwate() -> tuple[list[dict], dict]:
 
 # ----------------------------------------------------------------- main ----
 
+def load_previous_pack(path: Path) -> dict:
+    """Load the last published bundle for per-source failure fallback."""
+    if not path.exists():
+        return {"meta": {"sources": []}, "records": []}
+    try:
+        pack = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(pack.get("records"), list):
+            raise ValueError("records is not a list")
+        return pack
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"Previous bundle unavailable for fallback: {exc}", file=sys.stderr)
+        return {"meta": {"sources": []}, "records": []}
+
+
+def write_pack_atomic(path: Path, text: str) -> None:
+    """Replace an output only after its complete new contents are written."""
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(text, encoding="utf-8")
+    temporary.replace(path)
+
+
 def build(json_out: Path, js_out: Path, sources: list[str]) -> int:
-    all_records, source_metas = [], []
+    previous = load_previous_pack(json_out)
+    previous_records = previous.get("records", [])
+    previous_metas = {
+        item.get("key"): item
+        for item in previous.get("meta", {}).get("sources", [])
+        if item.get("key")
+    }
+    all_records, source_metas, failures = [], [], []
     for key in sources:
         if key not in ADAPTERS:
             print(f"Unknown source '{key}' (available: {', '.join(ADAPTERS)})",
@@ -486,8 +537,21 @@ def build(json_out: Path, js_out: Path, sources: list[str]) -> int:
         try:
             recs, meta = ADAPTERS[key]()
         except Exception as e:
-            print(f"  {key} FAILED, skipping this source: {e}", file=sys.stderr)
-            continue
+            fallback = [r for r in previous_records if r.get("source_key") == key]
+            previous_meta = previous_metas.get(key)
+            failures.append({"source_key": key, "message": str(e)[:240]})
+            if not fallback or not previous_meta:
+                print(f"  {key} FAILED, no fallback available: {e}", file=sys.stderr)
+                continue
+            recs = fallback
+            meta = dict(previous_meta)
+            meta["fetch_status"] = "stale_fallback"
+            meta["last_fetch_attempt"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            print(f"  {key} FAILED; retaining {len(recs):,} last-known-good records",
+                  file=sys.stderr)
+        else:
+            meta["fetch_status"] = "current"
+            meta["last_fetch_attempt"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
         print(f"  {len(recs):,} records")
         all_records.extend(recs)
         source_metas.append(meta)
@@ -505,14 +569,15 @@ def build(json_out: Path, js_out: Path, sources: list[str]) -> int:
         "sources": source_metas,
         "coverage": COVERAGE,
         "universal_links": UNIVERSAL_LINKS,
+        "ingestion_failures": failures,
     }
     pack = {"meta": meta, "records": all_records}
 
-    json_out.write_text(json.dumps(pack, ensure_ascii=False), encoding="utf-8")
-    js_out.write_text(
+    write_pack_atomic(json_out, json.dumps(pack, ensure_ascii=False))
+    write_pack_atomic(
+        js_out,
         "window.BEAR_DATA=" +
-        json.dumps(pack, ensure_ascii=False, separators=(",", ":")) + ";",
-        encoding="utf-8")
+        json.dumps(pack, ensure_ascii=False, separators=(",", ":")) + ";")
     return len(all_records)
 
 
