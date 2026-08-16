@@ -5,9 +5,11 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#13231b">
 <title>BearWatch Japan — Official Bear Activity</title>
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
-<link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css">
-<link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css">
+<!-- Leaflet is vendored locally (vendor/) so the map keeps working on flaky
+     connections and never depends on a third-party CDN being reachable. -->
+<link rel="stylesheet" href="vendor/leaflet.css">
+<link rel="stylesheet" href="vendor/MarkerCluster.css">
+<link rel="stylesheet" href="vendor/MarkerCluster.Default.css">
 <style>
 :root{
   --forest:#173c2b;--forest-2:#24563e;--ink:#17211c;--muted:#68756e;
@@ -102,9 +104,9 @@ details{border-top:1px solid var(--line);margin-top:14px;padding-top:13px}summar
   </aside>
   <div id="map" role="region" aria-label="Interactive map of reported bear activity in Japan"></div>
 </div>
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-<script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
-<script src="https://unpkg.com/leaflet.heat@0.2.0/dist/leaflet-heat.js"></script>
+<script src="vendor/leaflet.js"></script>
+<script src="vendor/leaflet.markercluster.js"></script>
+<script src="vendor/leaflet-heat.js"></script>
 <script src="bear_data.js"></script>
 <script src="prefectures.js"></script>
 <script>
@@ -115,7 +117,7 @@ window.addEventListener('error', e=>{
 });
 if(!window.BEAR_DATA){
   document.getElementById('stat').textContent =
-    'bear_data.js not found. Keep it in the same folder as index.html, or regenerate it with ingest.py.';
+    'bear_data.js not found. Keep it (and the vendor/ folder) next to index.html, or regenerate it with ingest.py.';
 }
 const PACK = window.BEAR_DATA || {meta:{sources:[]}, records:[]};
 const DATA = PACK.records;
@@ -146,14 +148,15 @@ const fc=document.getElementById('freshCount'); if(fc) fc.textContent=freshSourc
 const TYPE_EN = {
   '目撃':'Sighting','痕跡(その他)':'Traces (other)','痕跡(食害)':'Traces (feeding damage)',
   '人身被害':'Human injury','痕跡':'Traces','目撃・痕跡':'Sighting + traces','その他':'Other',
+  '人身':'Human injury','目撃（クマAIカメラ等）':'AI-camera sighting',
   'Witness':'Sighting','trace':'Traces','Filming':'Camera footage','capture':'Capture'
 };
 const label = t => TYPE_EN[t] && TYPE_EN[t]!==t ? `${t} · ${TYPE_EN[t]}` : t;
-const INJURY_TYPES = new Set(['人身被害']);
+const INJURY_TYPES = new Set(['人身被害','人身']);
 function canonicalType(t){
   if(INJURY_TYPES.has(t))return 'injury';
   if(['capture'].includes(t))return 'capture';
-  if(['目撃','Witness','Filming'].includes(t))return 'sighting';
+  if(['目撃','目撃（クマAIカメラ等）','Witness','Filming'].includes(t))return 'sighting';
   if(['痕跡(その他)','痕跡(食害)','痕跡','trace','目撃・痕跡'].includes(t))return 'trace';
   return 'other';
 }
@@ -162,11 +165,7 @@ const map = L.map('map',{preferCanvas:true});
 L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{
   maxZoom:19,attribution:'© OpenStreetMap contributors'
 }).addTo(map);
-if(DATA.length){
-  map.fitBounds([[24,122],[46,146]],{padding:[20,20],maxZoom:5});
-}else{
-  map.fitBounds([[24,122],[46,146]],{padding:[20,20],maxZoom:5});
-}
+map.fitBounds([[24,122],[46,146]],{padding:[20,20],maxZoom:5});
 
 // ---- Nationwide coverage overlay -------------------------------------
 // Shades every prefecture by data status so a blank area is never ambiguous.
@@ -372,6 +371,7 @@ function apply(){
      ${x.location?`<br>${escapeHtml(x.location)}`:''}
      ${x.description?`<br><br>${escapeHtml(x.description)}`:''}
      ${x.accuracy?`<br><small>Location accuracy: ${escapeHtml(x.accuracy)}</small>`:''}
+     ${x.archived?`<br><small>Retained history: no longer in the source's current window</small>`:''}
      ${dist!==null?`<br><b>${dist.toFixed(1)} km from your location</b>`:''}
      <br><small>Source: ${escapeHtml(srcMeta.name||x.source_key)} · ID ${escapeHtml(x.id)}</small>`);
    markers.push(marker);
@@ -380,7 +380,7 @@ function apply(){
  if(view==='heat'){
    if(typeof L.heatLayer!=='function'){
      document.getElementById('stat').textContent=
-       'Heatmap library could not be loaded (check your internet connection); showing clustered points instead.';
+       'Heatmap library could not be loaded (vendor/leaflet-heat.js missing?); showing clustered points instead.';
      document.getElementById('view').value='cluster';
      return apply();
    }

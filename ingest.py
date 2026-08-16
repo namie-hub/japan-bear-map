@@ -18,10 +18,13 @@ Usage:
 from datetime import datetime, timezone
 from pathlib import Path
 import argparse
+import hashlib
+import html as html_lib
 import json
 import re
 import sys
 import time
+from urllib.parse import urlencode
 
 import pandas as pd
 import requests
@@ -46,6 +49,21 @@ def jst_iso(value) -> str:
     return ts.isoformat()
 
 
+def content_id(source_key: str, seen: dict, *parts) -> str:
+    """Stable record ID derived from the record's own content.
+
+    Survives row reordering across republished files and source-side ID
+    recycling (e.g. Fukui's rolling 'Num'). `seen` tracks collisions — two
+    otherwise-identical reports — and suffixes them deterministically.
+    """
+    digest = hashlib.sha1(
+        "|".join(str(p) for p in parts).encode("utf-8")).hexdigest()[:12]
+    base = f"{source_key}-{digest}"
+    n = seen.get(base, 0)
+    seen[base] = n + 1
+    return base if n == 0 else f"{base}-{n + 1}"
+
+
 def download(url: str, retries: int = 3, backoff: float = 5.0) -> bytes:
     last_err = None
     for attempt in range(1, retries + 1):
@@ -59,6 +77,59 @@ def download(url: str, retries: int = 3, backoff: float = 5.0) -> bytes:
             if attempt < retries:
                 time.sleep(backoff * attempt)
     raise RuntimeError(f"Could not download {url}: {last_err}")
+
+
+def fetch_arcgis_geojson(layer_url: str, page_size: int = 1000) -> list[dict]:
+    """Read every public feature from an ArcGIS FeatureServer layer."""
+    features, offset = [], 0
+    while True:
+        params = {
+            "where": "1=1",
+            "outFields": "*",
+            "returnGeometry": "true",
+            "orderByFields": "objectid",
+            "resultOffset": offset,
+            "resultRecordCount": page_size,
+            "f": "geojson",
+        }
+        payload = json.loads(download(layer_url + "/query?" + urlencode(params)))
+        if payload.get("error"):
+            raise RuntimeError(f"ArcGIS query failed: {payload['error']}")
+        page = payload.get("features", [])
+        features.extend(page)
+        if not page or not payload.get("properties", {}).get("exceededTransferLimit"):
+            break
+        offset += len(page)
+    return features
+
+
+def arcgis_datetime(milliseconds, time_text: str = "") -> str:
+    """Convert an ArcGIS epoch-millisecond date to an explicit JST value."""
+    ts = pd.to_datetime(milliseconds, unit="ms", utc=True, errors="coerce")
+    if pd.isna(ts):
+        return ""
+    ts = ts.tz_convert("Asia/Tokyo")
+    match = re.match(r"^(\d{1,2}):(\d{2})", clean(time_text))
+    if match:
+        ts = ts.replace(hour=int(match.group(1)), minute=int(match.group(2)),
+                        second=0, microsecond=0)
+    return ts.isoformat()
+
+
+def feature_point(feature: dict, bounds: tuple[float, float, float, float]):
+    """Return a validated (lat, lon) pair, or None."""
+    geometry = feature.get("geometry") or {}
+    coordinates = geometry.get("coordinates") or []
+    if len(coordinates) < 2:
+        return None
+    try:
+        lon, lat = float(coordinates[0]), float(coordinates[1])
+    except (TypeError, ValueError):
+        return None
+    lat_min, lat_max, lon_min, lon_max = bounds
+    if not (lat_min <= lat <= lat_max and lon_min <= lon <= lon_max):
+        return None
+    return round(lat, 6), round(lon, 6)
 
 
 # ---------------------------------------------------------------- Akita ----
@@ -340,6 +411,7 @@ def fetch_yamagata() -> tuple[list[dict], dict]:
     df = df[df["latitude"].between(la, lb) & df["longitude"].between(lo, lp)]
 
     records = []
+    seen_ids: dict = {}
     for i, r in df.iterrows():
         ts = r["reported_at"]
         t = clean(r.get("目撃した時間帯（0:00～24:00）"))
@@ -356,7 +428,10 @@ def fetch_yamagata() -> tuple[list[dict], dict]:
             ("市街地" if urban == "市街地" else ""),
             clean(r.get("備考"))] if x)
         records.append({
-            "id": f"yamagata-{i}",
+            "id": content_id("yamagata", seen_ids, jst_iso(ts),
+                             round(float(r["latitude"]), 6),
+                             round(float(r["longitude"]), 6),
+                             clean(r.get("地名等")), desc),
             "source_key": "yamagata",
             "incident_type": "目撃",
             "municipality": clean(r.get("ユーザ名")),
@@ -392,8 +467,271 @@ def fetch_yamagata() -> tuple[list[dict], dict]:
     return records, source_meta
 
 
-ADAPTERS = {"akita": fetch_akita, "tokyo": fetch_tokyo,
-            "tottori": fetch_tottori, "yamagata": fetch_yamagata}
+# --------------------------------------------------------------- Toyama ----
+
+TOYAMA_LAYER = ("https://services7.arcgis.com/pUdPpUsq83Kw8pWi/arcgis/rest/"
+                "services/survey123_3f07f1f9864d43368d48b5f373d6cd68_results/"
+                "FeatureServer/0")
+TOYAMA_PAGE = ("https://www.pref.toyama.jp/1709/kurashi/kankyoushizen/"
+               "shizen/yaseiseibutsu/kumap.html")
+TOYAMA_MAP = ("https://pref-toyama-1709.maps.arcgis.com/apps/dashboards/"
+              "daffbc92f82342339aa6bf3c83ab4742")
+TOYAMA_BOX = (36.2, 37.1, 136.6, 138.0)
+
+
+def fetch_toyama() -> tuple[list[dict], dict]:
+    features = fetch_arcgis_geojson(TOYAMA_LAYER)
+    records = []
+    for feature in features:
+        point = feature_point(feature, TOYAMA_BOX)
+        p = feature.get("properties") or {}
+        reported_at = arcgis_datetime(p.get("HasseiDateTime"))
+        if not point or not reported_at:
+            continue
+        adult = clean(p.get("BearAdult"))
+        young = clean(p.get("BearYoung"))
+        unknown = clean(p.get("BearUnknown"))
+        count_parts = [f"成獣{adult}" if adult else "",
+                       f"幼獣{young}" if young else "",
+                       f"不明{unknown}" if unknown else ""]
+        lat, lon = point
+        records.append({
+            "id": f"toyama-{clean(p.get('globalid')) or clean(p.get('objectid'))}",
+            "source_key": "toyama",
+            "incident_type": clean(p.get("HoukokuType")) or "その他",
+            "municipality": clean(p.get("HasseiCity")),
+            "location": clean(p.get("HasseiArea")),
+            "reported_at": reported_at,
+            "species": "Asian black bear",
+            "sex": "",
+            "family_status": "親子" if young else "",
+            "count": " / ".join(x for x in count_parts if x),
+            "description": clean(p.get("TsuhoInfo")),
+            "accuracy": "official public map point",
+            "latitude": lat,
+            "longitude": lon,
+        })
+    dates = [r["reported_at"] for r in records]
+    return records, {
+        "key": "toyama",
+        "name": "Toyama Prefecture Kumappu",
+        "url": TOYAMA_PAGE,
+        "live_map": TOYAMA_MAP,
+        "license": "Official public ArcGIS layer; reuse licence not stated",
+        "record_count": len(records),
+        "raw_row_count": len(features),
+        "date_min": min(dates) if dates else None,
+        "date_max": max(dates) if dates else None,
+        "published": max(dates)[:10] if dates else "",
+        "update_cadence": "Near-real-time entries by municipalities",
+        "quality": ("Official prefectural public map with incident type, time, "
+                    "municipality and bear counts. Public ArcGIS item metadata "
+                    "does not state a reuse licence; verify before republication."),
+    }
+
+
+# ---------------------------------------------------------------- Gunma ----
+
+GUNMA_LAYER = ("https://services7.arcgis.com/DkC6f6v0YUQX0rke/arcgis/rest/"
+               "services/survey123_a77f33a9b9f649cfada5c7983c67874b_results/"
+               "FeatureServer/0")
+GUNMA_PAGE = "https://www.pref.gunma.jp/page/7141.html"
+GUNMA_MAP = ("https://pref-gunma.maps.arcgis.com/apps/dashboards/"
+             "5276d2ebf02a42da8595ed2a51a334c8")
+GUNMA_BOX = (35.8, 37.1, 138.2, 139.8)
+
+
+def fetch_gunma() -> tuple[list[dict], dict]:
+    features = fetch_arcgis_geojson(GUNMA_LAYER)
+    records = []
+    for feature in features:
+        point = feature_point(feature, GUNMA_BOX)
+        p = feature.get("properties") or {}
+        reported_at = arcgis_datetime(p.get("field_18") or p.get("field_7"),
+                                      p.get("field_20"))
+        if not point or not reported_at:
+            continue
+        place = clean(p.get("field_11") or p.get("field_14"))
+        municipality_match = re.match(r"^(.{1,10}?[市町村])", place)
+        municipality = municipality_match.group(1) if municipality_match else ""
+        injury = clean(p.get("field_22"))
+        incident_type = "人身被害" if injury and injury not in {"なし", "無し", "無"} else "目撃"
+        description = " / ".join(x for x in [clean(p.get("field10")), injury] if x)
+        lat, lon = point
+        records.append({
+            "id": f"gunma-{clean(p.get('globalid')) or clean(p.get('objectid'))}",
+            "source_key": "gunma",
+            "incident_type": incident_type,
+            "municipality": municipality,
+            "location": place,
+            "reported_at": reported_at,
+            "species": "Asian black bear",
+            "sex": "",
+            "family_status": clean(p.get("field_21")),
+            "count": clean(p.get("field_8")),
+            "description": description,
+            "accuracy": "official public map point",
+            "latitude": lat,
+            "longitude": lon,
+        })
+    dates = [r["reported_at"] for r in records]
+    return records, {
+        "key": "gunma",
+        "name": "Gunma Prefecture bear occurrence map",
+        "url": GUNMA_PAGE,
+        "live_map": GUNMA_MAP,
+        "license": "Official public ArcGIS layer; reuse licence not stated",
+        "record_count": len(records),
+        "raw_row_count": len(features),
+        "date_min": min(dates) if dates else None,
+        "date_max": max(dates) if dates else None,
+        "published": max(dates)[:10] if dates else "",
+        "update_cadence": "Near-real-time entries by municipalities",
+        "quality": ("Official prefectural public map with location, time and "
+                    "bear count. Municipality is parsed from the published "
+                    "place field. Reuse licence is not stated in item metadata."),
+    }
+
+
+# -------------------------------------------------------------- Niigata ----
+
+NIIGATA_LAYER = ("https://services6.arcgis.com/SKz58fvdFlaEB35q/arcgis/rest/"
+                 "services/survey123_08d14b98657b47309b868f49602375c8_results/"
+                 "FeatureServer/0")
+NIIGATA_PAGE = ("https://www.pref.niigata.lg.jp/site/tyoujyutaisakusienn/"
+                "1319666477308.html")
+NIIGATA_MAP = ("https://www.arcgis.com/apps/dashboards/"
+               "20b4d06fb3b34776959a4e69c7a8511a")
+NIIGATA_BOX = (36.6, 38.8, 137.5, 139.95)
+
+
+def fetch_niigata() -> tuple[list[dict], dict]:
+    features = fetch_arcgis_geojson(NIIGATA_LAYER)
+    records = []
+    for feature in features:
+        point = feature_point(feature, NIIGATA_BOX)
+        p = feature.get("properties") or {}
+        reported_at = arcgis_datetime(p.get("field_20"), p.get("field_21"))
+        if not point or not reported_at:
+            continue
+        reason = clean(p.get("field_19"))
+        other_reason = clean(p.get("field_19_other"))
+        description = " / ".join(x for x in [clean(p.get("field_9")), reason,
+                                                other_reason] if x)
+        lat, lon = point
+        records.append({
+            "id": f"niigata-{clean(p.get('globalid')) or clean(p.get('objectid'))}",
+            "source_key": "niigata",
+            "incident_type": clean(p.get("field_8")) or "その他",
+            "municipality": clean(p.get("field_7")),
+            "location": clean(p.get("field_17")),
+            "reported_at": reported_at,
+            "species": "Asian black bear",
+            "sex": "",
+            "family_status": "",
+            "count": clean(p.get("field_26")),
+            "description": description,
+            "accuracy": "official public map point",
+            "latitude": lat,
+            "longitude": lon,
+        })
+    dates = [r["reported_at"] for r in records]
+    return records, {
+        "key": "niigata",
+        "name": "Niigata Prefecture bear occurrence map",
+        "url": NIIGATA_PAGE,
+        "live_map": NIIGATA_MAP,
+        "license": "Official public ArcGIS layer; reuse licence not stated",
+        "record_count": len(records),
+        "raw_row_count": len(features),
+        "date_min": min(dates) if dates else None,
+        "date_max": max(dates) if dates else None,
+        "published": max(dates)[:10] if dates else "",
+        "update_cadence": "Current fiscal-year map, updated continuously",
+        "quality": ("Official prefectural current-fiscal-year layer with type, "
+                    "municipality, time, count and narrative. Reuse licence is "
+                    "not stated in the ArcGIS item metadata."),
+    }
+
+
+# ---------------------------------------------------------------- Fukui ----
+
+FUKUI_PAGE = "https://tsukinowaguma.pref.fukui.lg.jp/KUMA/Top.aspx"
+FUKUI_INFO = ("https://www.pref.fukui.lg.jp/doc/shizen/tixyouzixyuu/"
+              "tukinowaguma2.html")
+FUKUI_BOX = (35.2, 36.4, 135.3, 137.0)
+
+
+def fetch_fukui() -> tuple[list[dict], dict]:
+    page = download(FUKUI_PAGE).decode("utf-8", errors="replace")
+    match = re.search(r'id="HeaderPlace_hdnKumaData"\s+value="(.*?)"\s*/>',
+                      page, flags=re.S)
+    if not match:
+        raise RuntimeError("Could not find the Fukui public map data payload")
+    rows = json.loads(html_lib.unescape(match.group(1)))
+    records = []
+    seen_ids: dict = {}
+    for row in rows:
+        try:
+            lat, lon = float(row.get("LAT")), float(row.get("LON"))
+        except (TypeError, ValueError):
+            continue
+        if not (FUKUI_BOX[0] <= lat <= FUKUI_BOX[1] and
+                FUKUI_BOX[2] <= lon <= FUKUI_BOX[3]):
+            continue
+        date = pd.to_datetime(clean(row.get("HIDUKE")), errors="coerce")
+        if pd.isna(date):
+            continue
+        time_text = clean(row.get("JIKAN"))
+        time_match = re.match(r"^(\d{1,2}):(\d{2})", time_text)
+        if time_match:
+            date = date.replace(hour=int(time_match.group(1)),
+                                minute=int(time_match.group(2)))
+        adult, young = clean(row.get("KOTAISEI")), clean(row.get("KOTAIYOU"))
+        records.append({
+            "id": content_id("fukui", seen_ids, jst_iso(date),
+                             round(lat, 6), round(lon, 6),
+                             clean(row.get("SHUBETU")), clean(row.get("SICHO")),
+                             clean(row.get("BASHO"))),
+            "source_key": "fukui",
+            "incident_type": clean(row.get("SHUBETU")) or "その他",
+            "municipality": clean(row.get("SICHO")),
+            "location": clean(row.get("BASHO")),
+            "reported_at": jst_iso(date),
+            "species": "Asian black bear",
+            "sex": "",
+            "family_status": "親子" if young and young != "0" else "",
+            "count": clean(row.get("TOSU")),
+            "description": "",
+            "accuracy": "official public map point",
+            "latitude": round(lat, 6),
+            "longitude": round(lon, 6),
+        })
+    dates = [r["reported_at"] for r in records]
+    return records, {
+        "key": "fukui",
+        "name": "Fukui Prefecture Bear Information",
+        "url": FUKUI_INFO,
+        "live_map": FUKUI_PAGE,
+        "license": "Official public website; reuse licence not stated",
+        "record_count": len(records),
+        "raw_row_count": len(rows),
+        "date_min": min(dates) if dates else None,
+        "date_max": max(dates) if dates else None,
+        "published": max(dates)[:10] if dates else "",
+        "update_cadence": "Rolling recent records, updated by municipalities",
+        "quality": ("Official prefectural public map payload. The public page "
+                    "currently exposes a rolling recent window, not full "
+                    "history; reuse licence is not stated."),
+    }
+
+
+ADAPTERS = {
+    "akita": fetch_akita, "tokyo": fetch_tokyo,
+    "tottori": fetch_tottori, "yamagata": fetch_yamagata,
+    "toyama": fetch_toyama, "gunma": fetch_gunma,
+    "niigata": fetch_niigata, "fukui": fetch_fukui,
+}
 
 
 # ------------------------------------------------- nationwide coverage -----
@@ -429,12 +767,12 @@ COVERAGE = {
              "note": "A frequently-updated Shimane+Tottori map exists but is "
                      "news-compiled (San'in press) with unclear reuse "
                      "licence; adapter written but disabled."},
-    "富山県": {"status": "possible",
-             "note": "Official real-time クマっぷ ArcGIS dashboard, with "
-                     "records from 2015; adapter and reuse review needed."},
-    "群馬県": {"status": "possible",
-             "note": "Official ArcGIS dashboard; FeatureServer endpoint "
-                     "likely queryable; adapter candidate."},
+    "富山県": {"status": "covered", "source_key": "toyama",
+             "note": "Official public ArcGIS layer; reuse licence is not "
+                     "stated in the item metadata."},
+    "群馬県": {"status": "covered", "source_key": "gunma",
+             "note": "Official public ArcGIS layer; reuse licence is not "
+                     "stated in the item metadata."},
     "青森県": {"status": "possible",
              "note": "Official くまログあおもり real-time system; public "
                      "submissions require a separate verification tier."},
@@ -443,12 +781,12 @@ COVERAGE = {
                      "not included. See fetch_iwate notes."},
     "宮城県": {"status": "possible",
              "note": "Annual 目撃等情報マップ published; format unverified."},
-    "新潟県": {"status": "possible",
-             "note": "Official ArcGIS bear-occurrence dashboard; adapter "
-                     "and reuse review needed."},
-    "福井県": {"status": "possible",
-             "note": "Official searchable bear-information system exposes "
-                     "structured incident details; reuse terms need review."},
+    "新潟県": {"status": "covered", "source_key": "niigata",
+             "note": "Official current-fiscal-year ArcGIS layer; reuse "
+                     "licence is not stated in the item metadata."},
+    "福井県": {"status": "covered", "source_key": "fukui",
+             "note": "Official public recent-record map payload; rolling "
+                     "window and reuse licence not stated."},
     "石川県": {"status": "possible",
              "note": "Official current-year sightings and analysis maps; "
                      "machine export and reuse terms need review."},
@@ -519,6 +857,62 @@ def write_pack_atomic(path: Path, text: str) -> None:
     temporary.replace(path)
 
 
+# Sources whose portals only expose a rolling or fiscal/calendar-year window.
+# For these, records seen in an earlier run but absent from the latest fetch
+# are retained (marked "archived": true) so history survives source resets —
+# e.g. Niigata/Tottori emptying out each April, Fukui's rolling window.
+ARCHIVE_SOURCES = {"tottori", "yamagata", "niigata", "fukui"}
+
+
+def merge_with_history(key: str, recs: list[dict],
+                       previous_records: list[dict]) -> tuple[list[dict], int]:
+    """Append previously-seen records that dropped out of the source window.
+
+    Dedupes both by id and by a content key (time+place+type), so a record
+    survives even if the source republishes it under a different id — and so
+    an id-scheme change never duplicates records.
+    """
+    new_ids = {r["id"] for r in recs}
+    new_content = {(r["reported_at"], r["latitude"], r["longitude"],
+                    r["incident_type"]) for r in recs}
+    retained = []
+    for r in previous_records:
+        if r.get("source_key") != key or r["id"] in new_ids:
+            continue
+        if (r["reported_at"], r["latitude"], r["longitude"],
+                r["incident_type"]) in new_content:
+            continue
+        kept = dict(r)
+        kept["archived"] = True
+        retained.append(kept)
+    return recs + retained, len(retained)
+
+
+def comparable(pack: dict) -> dict:
+    """The pack minus run-timestamp churn, for change detection.
+
+    generated_at and last_fetch_attempt change on every run even when no
+    report changed; comparing without them lets an unchanged build skip
+    writing, so the CI 'commit only if changed' guard actually skips.
+    """
+    meta = {k: v for k, v in pack.get("meta", {}).items()
+            if k != "generated_at"}
+    meta["sources"] = [
+        {k: v for k, v in s.items() if k != "last_fetch_attempt"}
+        for s in meta.get("sources", [])]
+    return {"meta": meta, "records": pack.get("records", [])}
+
+
+def serialize_pack(pack: dict) -> str:
+    """JSON with one record per line, so git diffs/deltas stay small."""
+    meta_json = json.dumps(pack["meta"], ensure_ascii=False,
+                           separators=(",", ":"))
+    records_json = ",\n".join(
+        json.dumps(r, ensure_ascii=False, separators=(",", ":"))
+        for r in pack["records"])
+    return '{"meta":' + meta_json + ',\n"records":[\n' + records_json + '\n]}'
+
+
 def build(json_out: Path, js_out: Path, sources: list[str]) -> int:
     previous = load_previous_pack(json_out)
     previous_records = previous.get("records", [])
@@ -552,14 +946,37 @@ def build(json_out: Path, js_out: Path, sources: list[str]) -> int:
         else:
             meta["fetch_status"] = "current"
             meta["last_fetch_attempt"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            if key in ARCHIVE_SOURCES:
+                recs, kept = merge_with_history(key, recs, previous_records)
+                meta["retained_history_count"] = kept
+                if kept:
+                    print(f"  +{kept:,} archived records retained from "
+                          f"earlier snapshots")
+                meta["record_count"] = len(recs)
+                dates = [r["reported_at"] for r in recs]
+                meta["date_min"] = min(dates) if dates else None
+                meta["date_max"] = max(dates) if dates else None
         print(f"  {len(recs):,} records")
         all_records.extend(recs)
         source_metas.append(meta)
 
+    # A partial run (--sources) must not silently drop the other sources:
+    # carry previous records and metadata through for anything not selected.
+    fetched_keys = {m.get("key") for m in source_metas}
+    for key, previous_meta in previous_metas.items():
+        if key in fetched_keys:
+            continue
+        carried = [r for r in previous_records if r.get("source_key") == key]
+        if not carried:
+            continue
+        all_records.extend(carried)
+        source_metas.append(dict(previous_meta))
+        print(f"Carrying {key} through unchanged ({len(carried):,} records)")
+
     if not all_records:
         raise SystemExit("No source produced data; refusing to write empty output.")
 
-    all_records.sort(key=lambda x: x["reported_at"], reverse=True)
+    all_records.sort(key=lambda x: (x["reported_at"], x["id"]), reverse=True)
 
     meta = {
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -573,11 +990,12 @@ def build(json_out: Path, js_out: Path, sources: list[str]) -> int:
     }
     pack = {"meta": meta, "records": all_records}
 
-    write_pack_atomic(json_out, json.dumps(pack, ensure_ascii=False))
-    write_pack_atomic(
-        js_out,
-        "window.BEAR_DATA=" +
-        json.dumps(pack, ensure_ascii=False, separators=(",", ":")) + ";")
+    if comparable(pack) == comparable(previous):
+        print("No effective data changes; outputs left untouched.")
+        return len(all_records)
+
+    write_pack_atomic(json_out, serialize_pack(pack))
+    write_pack_atomic(js_out, "window.BEAR_DATA=" + serialize_pack(pack) + ";")
     return len(all_records)
 
 
@@ -585,7 +1003,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--json", default="akita_bears.json")
     parser.add_argument("--js", default="bear_data.js")
-    parser.add_argument("--sources", default="akita,tokyo,tottori,yamagata",
+    parser.add_argument("--sources", default=("akita,tokyo,tottori,yamagata,"
+                                              "toyama,gunma,niigata,fukui"),
                         help="comma-separated: " + ",".join(ADAPTERS))
     args = parser.parse_args()
 
